@@ -190,14 +190,25 @@ def find_last_date(folder: Path, time_col: str) -> date | None:
 # ============================================================================
 
 def update_spot(start: str, end: str, force: bool):
-    print("  spot (Elspotprices):")
-    df = fetch_eds("Elspotprices", start, end)
+    print("  spot (DayAheadPrices):")
+    df = fetch_eds("DayAheadPrices", start, end)
     if df.empty:
         print("    ingen data returneret")
         return
-    # Normaliser kolonnenavne så vi matcher den eksisterende cache-struktur
-    rename = {"HourUTC": "hour_utc", "HourDK": "hour_dk", "PriceArea": "price_area",
-              "SpotPriceDKK": "spot_price_dkk", "SpotPriceEUR": "spot_price_eur"}
+    # Normaliser kolonnenavne så de matcher den eksisterende cache-struktur.
+    # DayAheadPrices afløser Elspotprices fra april 2026 sammenfaldende med
+    # ISP15-fuld-overgangen. Skemaforskelle ift. det gamle endpoint:
+    #   TimeUTC           ← var HourUTC          (nu altid 15-min opløsning)
+    #   TimeDK            ← var HourDK
+    #   PriceArea         (uændret)
+    #   DayAheadPriceDKK  ← var SpotPriceDKK
+    #   DayAheadPriceEUR  ← var SpotPriceEUR
+    # CSV-kolonnerne i repo'et bevares som 'hour_utc'/'hour_dk'/'spot_price_dkk'
+    # for bagudkompatibilitet med data_loader.py og data_loader_github.py.
+    # Navnet 'hour_utc' er nu strengt taget misvisende (15-min, ikke time),
+    # men det er tidsstemplet i kolonnen der bestemmer adressering, ikke navnet.
+    rename = {"TimeUTC": "hour_utc", "TimeDK": "hour_dk", "PriceArea": "price_area",
+              "DayAheadPriceDKK": "spot_price_dkk", "DayAheadPriceEUR": "spot_price_eur"}
     df = df.rename(columns=rename)
     split_and_write(df, "hour_utc", "price_area", REPO_ROOT / "spot", force=force)
 
