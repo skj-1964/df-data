@@ -46,7 +46,7 @@ BASE_URL_EDS   = "https://api.energidataservice.dk/dataset"
 PRICE_ZONES = ["DK1", "DK2"]
 AFRR_ZONES  = ["DK1"]                                # DK2 har endnu ikke aFRR-marked
 MFRR_ZONES  = ["DK1", "DK2"]
-DMI_AREAS   = ["fyn","vestkyst"]                                # tilføj fx 'jylland_syd', 'sjaelland'
+DMI_AREAS   = ["fyn","vestkyst","karup"]             # tilføj fx 'jylland_syd', 'sjaelland'
 
 # Timeout og retry pr. API-kald
 TIMEOUT_SEC = 120
