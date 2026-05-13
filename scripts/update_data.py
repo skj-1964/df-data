@@ -111,7 +111,7 @@ def fetch_dmi(area: str, start: str, end: str) -> pd.DataFrame:
             "offset": offset,
             "format": "json",
         }
-        url = f"{BASE_URL_PROXY}/api_dmi_obs.php?" + urllib.parse.urlencode(params)
+        url = f"{BASE_URL_PROXY}/api_dmi_obs_ny.php?" + urllib.parse.urlencode(params)
         resp = http_get_json(url)
         records = resp.get("data", []) if isinstance(resp, dict) else []
         if not records:
