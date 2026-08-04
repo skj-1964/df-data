@@ -39,7 +39,7 @@ import pandas as pd
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-BASE_URL_PROXY = "https://www.sysapp.dk"            # samme proxy som modellen bruger
+BASE_URL_PROXY = "https://api.sysapp.dk"            # samme proxy som modellen bruger
 BASE_URL_EDS   = "https://api.energidataservice.dk/dataset"
 
 # Hvilke priszoner og DMI-områder skal hentes
