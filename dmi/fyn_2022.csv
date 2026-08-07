@@ -1,0 +1,2 @@
+unixtime,hour_utc,hour_dk,area,temp_mean_past1h,radia_glob_past1h,wind_speed_past1h,precip_past1h,pressure,humidity_past1h,cloud_cover
+1672527600,2022-12-31 23:00:00,2023-01-01 00:00:00,fyn,7.1,0.0,2.6,1.42333,996.796,98.0,90.0

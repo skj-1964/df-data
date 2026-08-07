@@ -1,0 +1,2 @@
+unixtime,hour_utc,hour_dk,area,temp_mean_past1h,radia_glob_past1h,wind_speed_past1h,precip_past1h,pressure,humidity_past1h,cloud_cover
+1672527600,2022-12-31 23:00:00,2023-01-01 00:00:00,vestkyst,5.56667,0.0,3.0,0.5,997.489,98.3333,93.3333
