@@ -5,6 +5,13 @@ compare_sources.py — bevis at kildeskiftet sysapp <-> EDS er neutralt.
 Henter den samme periode fra begge kilder, normaliserer begge til den frosne
 CSV-kontrakt, og sammenligner række for række. Skriver ikke i repo'et.
 
+--start/--end er bare datoer på UTC-aksen, --end inklusiv. Begge sider leverer
+præcis det vindue: sysapp fordi dets enddate allerede har den betydning, EDS
+fordi fetch_sysapp's modpart fetch_eds henter et superset og klipper. Uden det
+sammenlignes et UTC-vindue mod et dansk-lokaltids-vindue, og resultatet er lige
+mange "manglende" og "ekstra" rækker i hver ende — en afvigelse der ligner en
+proxy-fejl, men er en fejl i sammenligningen.
+
 Det her er det skridt der gør kildeskiftet forsvarligt. Uden det er den eneste
 måde at opdage en systematisk afvigelse på, at en modelkørsel giver et tal der
 ser forkert nok ud til at nogen studser — og en forskel på fx en enkelt time i
@@ -29,8 +36,10 @@ import update_data as U
 
 def _sysapp_balance(dataset: str, zone: str, start: str, end: str,
                     rename: dict, extra: dict | None = None) -> pd.DataFrame:
+    # `enddate` er en inklusiv bar dato paa UTC-aksen — serveren laegger selv
+    # doegnet til. Se datosemantik-blokken i update_data.py.
     params = {"dataset": dataset, "startdate": start,
-              "enddate": U.exclusive_end(end), "area": zone}
+              "enddate": end, "area": zone}
     if extra:
         params.update(extra)
     return U.normalize(U.fetch_sysapp("api_eds_balance.php", params), rename)

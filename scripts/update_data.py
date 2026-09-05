@@ -200,13 +200,27 @@ def fetch_sysapp(path: str, params: dict) -> pd.DataFrame:
 
 
 def fetch_eds(endpoint: str, start: str, end: str, zone: str | None = None) -> pd.DataFrame:
-    """Henter et helt datasæt fra Energi Data Service (paginerer til alt er hentet)."""
+    """
+    Henter fra Energi Data Service for UTC-døgnene [start, end] (end inklusiv)
+    og klipper til præcis det vindue.
+
+    EDS filtrerer på dansk lokaltid med halvåbent interval, så et bart `end=D`
+    betyder `D T00:00` DANSK tid — to timer før UTC-døgnets slut om sommeren,
+    én om vinteren. Sendes `end` uændret, taber hver kørsel stille den sidste
+    dag (og `start == end` giver nul rækker). Derfor hentes et superset og
+    klippes ned bagefter, så resultatet er sammenligneligt med sysapps
+    UTC-vindue række for række. Se datosemantik-blokken nedenfor.
+    """
+    # +2 dage: DK-midnat på end+2 ligger 22:00 UTC på end+1, altså sikkert
+    # efter UTC-vinduets slut i både sommer- og vintertid. +1 ville ikke være
+    # nok — den lander 22:00 UTC på end, to timer for tidligt.
+    req_end = (date.fromisoformat(end) + timedelta(days=2)).isoformat()
     rows: list[dict] = []
     offset = 0
     limit = 5000
     filt = json.dumps({"PriceArea": [zone]}) if zone else None
     for _ in range(MAX_PAGES):
-        params = {"start": start, "end": end, "offset": offset, "limit": limit}
+        params = {"start": start, "end": req_end, "offset": offset, "limit": limit}
         if filt:
             params["filter"] = filt
         url = f"{BASE_URL_EDS}/{endpoint}?" + urllib.parse.urlencode(params)
@@ -218,7 +232,7 @@ def fetch_eds(endpoint: str, start: str, end: str, zone: str | None = None) -> p
         if len(records) < limit:
             break
         offset += limit
-    return pd.DataFrame(rows)
+    return clip_to_utc_window(pd.DataFrame(rows), start, end)
 
 
 # ============================================================================
@@ -414,15 +428,46 @@ def find_last_date(folder: Path, time_col: str) -> date | None:
     return latest.date() if latest is not None else None
 
 
-def exclusive_end(end: str) -> str:
+# ----------------------------------------------------------------------------
+# DATOSEMANTIK — målt, ikke antaget (F6 Gate 0, verificeret igen 2026-09-05)
+#
+#                   | api.sysapp.dk        | api.energidataservice.dk
+#   --------------- | -------------------- | ------------------------
+#   filterakse      | UTC                  | dansk lokaltid
+#   bar end-dato    | inklusiv hele døgnet | T00:00, eksklusiv
+#   start == end    | hele døgnet          | 0 rækker
+#
+# De to API'er deler datasætnavne og deler intet i datosemantik. Alle tre
+# sysapp-endpoints (api_eds_balance, api_energinet_prices, api_dmi_obs_ny) er
+# målt enige: `enddate` er en inklusiv bar dato på UTC-aksen, og serveren
+# lægger selv døgnet til (`meta.range_utc.to_exclusive == enddate + 1 dag`).
+# Derfor sendes `end` UÆNDRET til sysapp. Lægges der et døgn til her, henter
+# hver månedskørsel én dag for meget — tavst. Det var fejlen indtil nu.
+#
+# EDS-siden håndteres i fetch_eds(), som henter et superset og klipper.
+# ----------------------------------------------------------------------------
+
+UTC_TIME_COLS = ("TimeUTC", "hour_utc")
+
+
+def clip_to_utc_window(df: pd.DataFrame, start: str, end: str) -> pd.DataFrame:
     """
-    api_eds_balance.php har halvåbent interval [startdate, enddate).
-    Alle øvrige endpoints — sysapps Energinet/DMI såvel som EDS — er
-    inklusive. Den forskel er den mest oplagte kilde til at miste stille og
-    roligt den sidste dag i hver månedskørsel, så den ligger eksplicit her
-    frem for at være gemt i et kald.
+    Klip til det halvåbne UTC-vindue [start 00:00, end+1d 00:00).
+
+    `start`/`end` er bare datoer, `end` inklusiv — samme betydning som sysapps
+    `startdate`/`enddate`. Det er dét der gør de to kilder sammenlignelige.
     """
-    return (date.fromisoformat(end) + timedelta(days=1)).isoformat()
+    if df.empty:
+        return df
+    col = next((c for c in UTC_TIME_COLS if c in df.columns), None)
+    if col is None:
+        print(f"    ADVARSEL: ingen UTC-tidskolonne i {list(df.columns)[:5]}…; "
+              f"kan ikke klippe til vinduet")
+        return df
+    lo = pd.Timestamp(start)
+    hi = pd.Timestamp(end) + pd.Timedelta(days=1)
+    t = pd.to_datetime(df[col], errors="coerce")
+    return df[(t >= lo) & (t < hi)].reset_index(drop=True)
 
 
 # ============================================================================
@@ -461,7 +506,7 @@ def _update_balance(name: str, sysapp_dataset: str, eds_endpoint: str,
             params = {
                 "dataset": sysapp_dataset,
                 "startdate": start,
-                "enddate": exclusive_end(end),   # halvåbent interval
+                "enddate": end,                  # inklusiv bar dato, UTC-akse
                 "area": zone,
             }
             # api_eds_balance.php afviser ukendte parametre med 400 i stedet
@@ -579,7 +624,7 @@ def determine_start(args) -> str:
     return (date.today() - timedelta(days=3 * 365)).isoformat()
 
 
-def main():
+def main() -> int:
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--source", choices=["sysapp", "eds"], default="sysapp",
@@ -604,6 +649,21 @@ def main():
         print(f"Springer over: {sorted(skip)}")
     print()
 
+    # Tomt interval er ikke en fejl når `start` er udledt: to kørsler i træk
+    # giver determine_start() = seneste dato + 1, altså i morgen, mens `--end`
+    # som default er i går. api_eds_balance.php afviser det med 400 ("Empty
+    # range"), så uden dette værn crasher en kørsel der reelt bare er en no-op.
+    # Det var maskeret indtil nu, fordi enddate fik lagt et døgn til og
+    # intervallet dermed blev gyldigt — se datosemantik-blokken ovenfor.
+    if start > end:
+        if args.start:
+            print(f"FEJL: --start {start} ligger efter --end {end}; "
+                  f"intet at hente.")
+            return 2
+        print(f"Intet at hente: repo'et dækker allerede til og med {end}. "
+              f"(Næste startdato ville være {start}.)")
+        return 0
+
     if "spot" not in skip:      update_spot(start, end, args.force, args.source)
     if "afrr" not in skip:      update_afrr(start, end, args.force, args.source)
     if "mfrr_cap" not in skip:  update_mfrr_cap(start, end, args.force, args.source)
@@ -614,7 +674,8 @@ def main():
     print()
     update_version_file(args.source)
     print("Færdig.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
