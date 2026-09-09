@@ -97,16 +97,23 @@ def check_no_deletions(repo: Path, r: Result) -> None:
 def check_gaps(repo: Path, r: Result) -> None:
     """Intet hul stoerre end datasaettets eget skridt, bortset fra kendte."""
     kendte = {
-        ("dmi", "fyn"): ["2026-02-28"],
-        ("dmi", "vestkyst"): ["2026-02-28"],
-        # Seriestarten i mfrr_capacity ligger i DK2, ikke DK1. Undtagelsen
-        # pegede paa den forkerte zone og har derfor aldrig virket — kontrollen
-        # var permanent roed, og en kontrol der altid er roed bliver ikke laest.
-        # Begge zoner starter 2023-06-23. Undtagelsen stod oprindeligt kun
-        # paa DK1, saa DK2 var permanent roed — og en kontrol der altid er
-        # roed bliver ikke laest.
+        ("dmi", "fyn"): ["2026-02-28", "2026-09-07"],
+        ("dmi", "vestkyst"): ["2026-02-28", "2026-09-07"],
+        # Begge zoner har hullet 2023-06-22 21:00 -> 2023-06-23 22:00, to
+        # doegn inde i serien. Undtagelsen stod oprindeligt kun paa DK1, saa
+        # DK2 var permanent roed — og en kontrol der altid er roed bliver
+        # ikke laest.
         ("mfrr_cap", "DK1"): ["2023-06-22"],
         ("mfrr_cap", "DK2"): ["2023-06-22"],
+
+        # Kendte kildefejl, maalt 2026-09-09. Hverken aFRR-doegnet eller
+        # DMI-timerne lukkes ved genhentning.
+        #   afrr DK1: hele auktionsdoegnet 4. september mangler hos sysapp.
+        #   dmi: 4-5 timer om formiddagen 7. september i alle tre omraader.
+        # NB: undtagelser er permanente og skjuler ogsaa et fremtidigt hul paa
+        # samme dato. Fylder kilden dem, boer de fjernes igen.
+        ("afrr", "DK1"): ["2026-09-03"],
+        ("dmi", "karup"): ["2026-09-07"],
     }
     for folder in DATA_DIRS:
         d = repo / folder
@@ -174,8 +181,20 @@ def check_spot_precision(repo: Path, r: Result) -> None:
         andel = x.groupby("m").nd.apply(lambda s: (s > 2).mean())
         flad = andel[andel < 0.5]
         if len(flad):
-            r.fail(f"spot/{f.name}: {len(flad)} maaned(er) efter {AERA_6DEC} "
-                   f"uden fuld praecision ({', '.join(flad.index[:4])})")
+            # Note, ikke fejl. Sysapp gemte spot afrundet til to decimaler
+            # frem til et sted mellem 12. august og 6. september 2026 og har
+            # ikke backfillet. Maalt paa Spor A marts-juni 2026 er forskellen
+            # mellem to og seks decimaler 1,11 DKK af 5,2 mio — 2e-7. Det er
+            # ikke vaerd at stoppe en koersel for, og en kontrol der er roed
+            # af noget vi har besluttet er ligegyldigt, laerer folk at
+            # ignorere roedt.
+            #
+            # Kontrollen beholdes som note, fordi den stadig kan opdage at
+            # kilden begynder at afrunde NYE data igen. Praecis den slags
+            # skift fandt vi to af i 2026.
+            r.note(f"spot/{f.name}: {len(flad)} maaned(er) efter {AERA_6DEC} "
+                   f"uden fuld praecision ({', '.join(flad.index[:4])}) "
+                   f"— kendt, uden betydning")
         else:
             r.ok(f"spot/{f.name}: praecision i orden efter aeragraensen")
 
