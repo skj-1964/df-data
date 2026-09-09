@@ -23,7 +23,6 @@ import pandas as pd
 
 DATA_DIRS = ["spot", "afrr", "mfrr_cap", "mfrr_act", "imbalance", "dmi"]
 TCOL = {"spot": "hour_utc", "dmi": "hour_utc"}
-AERA_6DEC = "2025-09-30"   # efter denne dato er 6 decimaler aegte
 
 
 class Result:
@@ -164,41 +163,6 @@ def check_mfrr_auction(repo: Path, r: Result) -> None:
             r.ok(f"mfrr_cap/{f.name}: 24 raekker/doegn")
 
 
-def check_spot_precision(repo: Path, r: Result) -> None:
-    """Efter aeragraensen skal spot have mere end to decimaler."""
-    d = repo / "spot"
-    if not d.exists():
-        return
-    for f in sorted(d.glob("DK*.csv")):
-        x = pd.read_csv(f, dtype=str, keep_default_na=False)
-        if "spot_price_dkk" not in x.columns:
-            continue
-        x = x[x["hour_utc"] > AERA_6DEC]
-        if x.empty:
-            continue
-        x = x.assign(m=x.hour_utc.str[:7],
-                     nd=x.spot_price_dkk.map(lambda s: len(s.split(".")[1]) if "." in s else 0))
-        andel = x.groupby("m").nd.apply(lambda s: (s > 2).mean())
-        flad = andel[andel < 0.5]
-        if len(flad):
-            # Note, ikke fejl. Sysapp gemte spot afrundet til to decimaler
-            # frem til et sted mellem 12. august og 6. september 2026 og har
-            # ikke backfillet. Maalt paa Spor A marts-juni 2026 er forskellen
-            # mellem to og seks decimaler 1,11 DKK af 5,2 mio — 2e-7. Det er
-            # ikke vaerd at stoppe en koersel for, og en kontrol der er roed
-            # af noget vi har besluttet er ligegyldigt, laerer folk at
-            # ignorere roedt.
-            #
-            # Kontrollen beholdes som note, fordi den stadig kan opdage at
-            # kilden begynder at afrunde NYE data igen. Praecis den slags
-            # skift fandt vi to af i 2026.
-            r.note(f"spot/{f.name}: {len(flad)} maaned(er) efter {AERA_6DEC} "
-                   f"uden fuld praecision ({', '.join(flad.index[:4])}) "
-                   f"— kendt, uden betydning")
-        else:
-            r.ok(f"spot/{f.name}: praecision i orden efter aeragraensen")
-
-
 def check_dmi_axis(repo: Path, r: Result) -> None:
     """hour_utc skal stemme med unixtime — kilden har fejlet her to gange."""
     d = repo / "dmi"
@@ -215,11 +179,23 @@ def check_dmi_axis(repo: Path, r: Result) -> None:
         r.ok("dmi: hour_utc stemmer med unixtime overalt")
 
 
+# Spot-praecisionen kontrolleres IKKE. Sysapp gemte spot afrundet til to
+# decimaler frem til et sted mellem 12. august og 6. september 2026 og har ikke
+# backfillet, saa en kontrol af hele serien ville vaere permanent roed. Maalt
+# paa Spor A marts-juni 2026 er forskellen mellem to og seks decimaler 1,11 DKK
+# af 5,2 mio — 2e-7. Kontrollen blev derfor foerst gjort til en note, men saa
+# kunne den ikke laengere blive roed, og selftesten afviste den med rette: en
+# note er dokumentation, ikke bevogtning. Den er fjernet frem for at staa som
+# en kontrol der ikke maaler noget.
+#
+# Skal den tilbage en dag, er den rigtige form ikke "findes der gamle maaneder
+# uden praecision" men "mangler de seneste 30 doegn praecision" — dvs. opdag at
+# kilden begynder at afrunde NYE data igen. Det er den fejl der betyder noget,
+# og den kan blive roed.
 CHECKS = [
     ("ingen slettede linjer", check_no_deletions),
     ("ingen uventede huller", check_gaps),
     ("mfrr_cap auction", check_mfrr_auction),
-    ("spot-praecision", check_spot_precision),
     ("dmi-akse", check_dmi_axis),
 ]
 
@@ -236,7 +212,6 @@ def selftest(repo: Path) -> int:
     sabotager = [
         ("ingen uventede huller", "dmi/karup_2026.csv", "drop"),
         ("mfrr_cap auction", "mfrr_cap/DK1_2026.csv", "drop"),
-        ("spot-praecision", "spot/DK1_2026.csv", "round"),
         ("dmi-akse", "dmi/fyn_2026.csv", "shift"),
     ]
     for navn, fil, hvordan in sabotager:
@@ -246,8 +221,6 @@ def selftest(repo: Path) -> int:
         x = pd.read_csv(p, dtype=str, keep_default_na=False)
         if hvordan == "drop":
             x = x.drop(x.index[len(x) // 2])
-        elif hvordan == "round":
-            x["spot_price_dkk"] = x.spot_price_dkk.map(lambda v: f"{float(v):.2f}")
         elif hvordan == "shift":
             x["hour_utc"] = (pd.to_datetime(x.hour_utc) + pd.Timedelta("1h")
                              ).dt.strftime("%Y-%m-%d %H:%M:%S")
