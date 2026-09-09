@@ -47,6 +47,12 @@ def tcol_for(folder: str) -> str:
     return TCOL.get(folder, "TimeUTC")
 
 
+# Datasaet hvor kilden reviderer allerede publicerede raekker, og hvor aendrede
+# linjer derfor ikke i sig selv er en fejl. Se check_no_deletions.
+REVISION_DATASETS = {"mfrr_act"}
+REVISION_MAX = 1000          # ~2,5 doegn i kvarter; rummer --lookback=2
+
+
 def check_no_deletions(repo: Path, r: Result) -> None:
     """
     Ingen slettede linjer i datafilerne.
@@ -60,13 +66,28 @@ def check_no_deletions(repo: Path, r: Result) -> None:
     if not out.strip():
         r.note("ingen aendringer i datafilerne")
         return
-    bad = []
+    bad, revideret = [], []
     for line in out.strip().splitlines():
         add, rem, path = line.split("\t")
-        if rem != "0" and rem != "-":
+        if rem == "0" or rem == "-":
+            continue
+        # sysapp reviderer mfrr_activation efter publicering: maalt 2026-09-09
+        # aendrede TotalmFRRDownMW og mFRRLocalUpMW sig ved genhentning af et
+        # doegn to maaneder gammelt. Ingen af dem bruges af modellen, men
+        # aendringen er aegte og ville ellers stoppe cron hver eneste nat.
+        # Graensen binder tolerancen til --lookback: en normal koersel henter
+        # kun faa doegn om igen, saa flere aendrede raekker end det betyder
+        # noget andet end en revision, og skal stadig vaere roedt.
+        if path.split("/")[0] in REVISION_DATASETS and int(rem) <= REVISION_MAX:
+            revideret.append(f"{path}: {rem} raekker revideret af kilden")
+        else:
             bad.append(f"{path}: {rem} slettede linjer")
+    for note in revideret:
+        r.note(note)
     if bad:
-        for b in bad[:5]:
+        # Ingen afkortning. Blev listen klippet, kunne kontrollen svare paa
+        # noget den ikke havde vist — praecis den tavshed den skal fjerne.
+        for b in bad:
             r.fail(b)
     else:
         n = len(out.strip().splitlines())
@@ -78,7 +99,14 @@ def check_gaps(repo: Path, r: Result) -> None:
     kendte = {
         ("dmi", "fyn"): ["2026-02-28"],
         ("dmi", "vestkyst"): ["2026-02-28"],
+        # Seriestarten i mfrr_capacity ligger i DK2, ikke DK1. Undtagelsen
+        # pegede paa den forkerte zone og har derfor aldrig virket — kontrollen
+        # var permanent roed, og en kontrol der altid er roed bliver ikke laest.
+        # Begge zoner starter 2023-06-23. Undtagelsen stod oprindeligt kun
+        # paa DK1, saa DK2 var permanent roed — og en kontrol der altid er
+        # roed bliver ikke laest.
         ("mfrr_cap", "DK1"): ["2023-06-22"],
+        ("mfrr_cap", "DK2"): ["2023-06-22"],
     }
     for folder in DATA_DIRS:
         d = repo / folder
@@ -219,6 +247,9 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--repo", default=".")
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--rebuild", action="store_true",
+                    help="Bevidst genhentning: slettede linjer er forventede "
+                         "og kontrolleres ikke. De oevrige kontroller koerer.")
     a = ap.parse_args()
     repo = Path(a.repo).resolve()
 
@@ -228,6 +259,9 @@ def main() -> int:
     print(f"=== verify_update: {repo} ===")
     r = Result()
     for navn, fn in CHECKS:
+        if a.rebuild and fn is check_no_deletions:
+            r.note("--rebuild: slettede linjer kontrolleres ikke")
+            continue
         fn(repo, r)
     print()
     if r.fails:
