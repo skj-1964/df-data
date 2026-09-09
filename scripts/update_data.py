@@ -771,6 +771,19 @@ def update_version_file(source: str):
 # ============================================================================
 
 def determine_start(args) -> str:
+    """
+    Udled startdato af eksisterende data, med et tilbageblik.
+
+    Tilbageblikket er ikke pyntelig forsigtighed. Uden det starter naeste
+    koersel dagen EFTER seneste raekke — og er den seneste dag ufuldstaendig,
+    fordi fx DMI-observationer haenger et par timer bagud ved hentetidspunktet,
+    bliver dens hale aldrig hentet. Under en manuel maanedskoersel er det en
+    engangsting man opdager. Under cron er det et hul der laegges i filerne
+    ved hver eneste koersel, permanent, uden et signal.
+
+    Det koster en genhentning af faa dage pr. koersel. Dedup goer den
+    idempotent, saa de dage giver ingen diff naar de er uaendrede.
+    """
     if args.start:
         return args.start
     candidates = []
@@ -779,7 +792,7 @@ def determine_start(args) -> str:
         if d:
             candidates.append(d)
     if candidates:
-        return (min(candidates) + timedelta(days=1)).isoformat()
+        return (min(candidates) - timedelta(days=args.lookback)).isoformat()
     return (date.today() - timedelta(days=3 * 365)).isoformat()
 
 
@@ -795,7 +808,17 @@ def main() -> int:
                    help="Overskriv eksisterende rækker i målperioden")
     p.add_argument("--skip", default="",
                    help="Komma-separeret liste af datasæt at springe over")
+    p.add_argument("--lookback", type=int, default=2,
+                   help="Doegn tilbage fra seneste raekke naar --start udelades "
+                        "(default: 2). Se determine_start.")
+    p.add_argument("--zones", default="",
+                   help="Komma-separeret liste, fx DK1,DK2. Overskriver "
+                        "PRICE_ZONES for denne koersel.")
     args = p.parse_args()
+
+    if args.zones:
+        globals()["PRICE_ZONES"] = [z.strip() for z in args.zones.split(",")
+                                    if z.strip()]
 
     start = determine_start(args)
     end = args.end
@@ -804,6 +827,7 @@ def main() -> int:
     print("=== df-data update ===")
     print(f"Kilde:   {args.source}")
     print(f"Periode: {start} → {end} (inklusiv)")
+    print(f"Zoner:   {PRICE_ZONES}")
     if skip:
         print(f"Springer over: {sorted(skip)}")
     print()
