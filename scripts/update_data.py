@@ -31,6 +31,7 @@ Kørselseksempler:
 from __future__ import annotations
 import argparse
 import io
+import re
 import json
 import sys
 import time
@@ -66,6 +67,15 @@ DMI_AREAS   = ["fyn", "vestkyst", "karup"]
 TIMEOUT_SEC = 120
 RETRY_COUNT = 3
 RETRY_SLEEP = 5
+# EDS-kvoter, malt af api-projektet 2026-09-07. Overskrides de, svarer EDS
+# 429 — og en retry-loop uden pause gor det vaerre, ikke bedre.
+#   Elspotprices:    1 kald pr. 299,9 s  -> 330 s pause
+#   DayAheadPrices:  3 kald pr. ~2 s     -> 20 s pause
+# Balance-datasaettenes kvoter er ikke malt; de far DayAhead-satsen, som er
+# den forsigtige af de to der er kendt.
+EDS_PAUSE_SEC = {"Elspotprices": 330.0}
+EDS_PAUSE_DEFAULT = 20.0
+_eds_last_call: dict[str, float] = {}
 PAGE_LIMIT  = 10000          # sysapp's loft; EDS bruger 5000
 MAX_PAGES   = 500            # sikkerhedsstop mod uendelig paginering
 
@@ -199,6 +209,18 @@ def fetch_sysapp(path: str, params: dict) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _eds_throttle(endpoint: str) -> None:
+    """Hold EDS-kvoten pr. endpoint. Forste kald venter ikke."""
+    pause = EDS_PAUSE_SEC.get(endpoint, EDS_PAUSE_DEFAULT)
+    prev = _eds_last_call.get(endpoint)
+    if prev is not None:
+        wait = pause - (time.monotonic() - prev)
+        if wait > 0:
+            print(f"    EDS-kvote: venter {wait:.0f}s for {endpoint}")
+            time.sleep(wait)
+    _eds_last_call[endpoint] = time.monotonic()
+
+
 def fetch_eds(endpoint: str, start: str, end: str, zone: str | None = None) -> pd.DataFrame:
     """
     Henter fra Energi Data Service for UTC-døgnene [start, end] (end inklusiv)
@@ -224,6 +246,7 @@ def fetch_eds(endpoint: str, start: str, end: str, zone: str | None = None) -> p
         if filt:
             params["filter"] = filt
         url = f"{BASE_URL_EDS}/{endpoint}?" + urllib.parse.urlencode(params)
+        _eds_throttle(endpoint)
         data = http_get_json(url)
         records = data.get("records", []) if isinstance(data, dict) else []
         if not records:
@@ -323,8 +346,85 @@ def _as_written_strings(df: pd.DataFrame) -> pd.DataFrame:
     return pd.read_csv(buf, dtype=str, keep_default_na=False)
 
 
+# --- Formatkonformitet -------------------------------------------------------
+# normalize() bruger pd.to_numeric pr. kolonne, og den resulterende dtype
+# afhaenger af batchens indhold: kun heltal -> int64 -> "331"; ét decimaltal
+# eller én NaN -> float64 -> "331.0". Filens format kom altsaa til at afhaenge
+# af hvad kilden tilfaeldigvis leverede i den enkelte hentning, og en
+# genhentning af de samme raekker kunne skifte format uden at vaerdien aendrede
+# sig. Under cron er der ingen der laeser diffen, saa den slags skal ikke kunne
+# opstaa. Reglen her er den samme som i reorder_like_existing: aarsfilen er
+# kontrakten, og nye raekker retter ind efter den.
+#
+# Kun to ting roeres — heltalsvaerdier og tidsstempler. Kolonner med aegte
+# decimaler passerer urørt, saa 29.8984 og 27.730766 kan ligge i samme kolonne.
+
+_INTEGRAL_RE = re.compile(r"^-?\d+(?:\.0+)?$")
+_TS_RE       = re.compile(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}")
+
+
+def _integral_suffix(col: pd.Series) -> str | None:
+    """Filens skrivemaade for heltal: '' , '.0', '.00' — None hvis uklar."""
+    v = col[col != ""]
+    m = v[v.str.match(_INTEGRAL_RE, na=False)]
+    if m.empty:
+        return None
+    suf = m.str.extract(r"(\.0+)$", expand=False).fillna("")
+    uniq = suf.unique()
+    return uniq[0] if len(uniq) == 1 else None
+
+
+def _ts_separator(col: pd.Series) -> str | None:
+    """Filens separator mellem dato og tid: 'T' eller ' ' — None hvis uklar."""
+    v = col[col != ""]
+    m = v[v.str.match(_TS_RE, na=False)]
+    if m.empty:
+        return None
+    uniq = m.str[10].unique()
+    return uniq[0] if len(uniq) == 1 else None
+
+
+def conform_to_existing(new_s: pd.DataFrame, old_s: pd.DataFrame,
+                        dest_name: str = "") -> pd.DataFrame:
+    """Ret nye strengraekker ind efter aarsfilens egen skrivemaade."""
+    new_s = new_s.copy()
+    noter: list[str] = []
+    for c in new_s.columns:
+        if c not in old_s.columns:
+            continue                      # ny kolonne: ingen konvention at foelge
+        old_v, new_v = old_s[c].astype(str), new_s[c].astype(str)
+
+        sep = _ts_separator(old_v)
+        if sep is not None:
+            mask = new_v.str.match(_TS_RE, na=False)
+            if mask.any():
+                afvig = mask & (new_v.str[10] != sep)
+                if afvig.any():
+                    new_s.loc[afvig, c] = (new_v[afvig].str[:10] + sep
+                                           + new_v[afvig].str[11:])
+                    noter.append(f"{c}: {int(afvig.sum())} tidsstempler -> '{sep}'")
+            continue
+
+        suf = _integral_suffix(old_v)
+        if suf is None:
+            continue                      # blandet eller ingen heltal: lad staa
+        mask = new_v.str.match(_INTEGRAL_RE, na=False)
+        if not mask.any():
+            continue
+        rettet = new_v[mask].str.replace(r"\.0+$", "", regex=True) + suf
+        afvig = mask & (new_v != rettet.reindex(new_v.index))
+        if afvig.any():
+            new_s.loc[afvig, c] = rettet[afvig]
+            noter.append(f"{c}: {int(afvig.sum())} heltal -> '{{n}}{suf}'")
+    if noter:
+        print(f"    {dest_name}: rettet ind efter filens format — "
+              + "; ".join(noter[:4]) + ("…" if len(noter) > 4 else ""))
+    return new_s
+
+
 def merge_into_yearfile(new_df: pd.DataFrame, dest: Path, time_col: str,
-                        force: bool = False) -> None:
+                        force: bool = False,
+                        window: tuple[str, str] | None = None) -> None:
     """
     Fletter `new_df` ind i `dest`, dedupliker på time_col + ev. PriceArea.
 
@@ -361,9 +461,25 @@ def merge_into_yearfile(new_df: pd.DataFrame, dest: Path, time_col: str,
             f"kunne ikke parses; foerste: {new_s[time_col][canon.isna()].iloc[0]!r}")
     new_s[time_col] = canon.dt.strftime(TIME_FMT)
 
-    if dest.exists() and not force:
+    if dest.exists():
         old_s = pd.read_csv(dest, dtype=str, keep_default_na=False)
         _check_key_format(old_s, time_col, dest)
+        if force:
+            # --force betyder "kasser det hentede vindue og skriv det forfra",
+            # IKKE "kasser filen". Uden vinduesafgraensningen ville en
+            # genhentning af fx marts slette hele resten af aarsfilen — malt
+            # til 14.104 tabte raekker paa spot/DK1_2026.csv. Rammer man den
+            # fejl, ser filen helt normal ud; den er bare kortere.
+            if window is None:
+                raise ValueError("force kraever et vindue")
+            ot = pd.to_datetime(old_s[time_col], errors="coerce")
+            lo = pd.Timestamp(window[0])
+            hi = pd.Timestamp(window[1]) + pd.Timedelta(days=1)
+            drop = ot.notna() & (ot >= lo) & (ot < hi)
+            if drop.any():
+                print(f"    {dest.name}: --force kasserer {int(drop.sum()):,} "
+                      f"raekker i {window[0]}..{window[1]}")
+            old_s = old_s[~drop]
         for c in old_s.columns:
             if c not in new_s.columns:
                 new_s[c] = ""
@@ -371,6 +487,7 @@ def merge_into_yearfile(new_df: pd.DataFrame, dest: Path, time_col: str,
             if c not in old_s.columns:
                 old_s[c] = ""
         new_s = new_s[old_s.columns]
+        new_s = conform_to_existing(new_s, old_s, dest.name)
         combined = pd.concat([old_s, new_s], ignore_index=True)
     else:
         combined = new_s
@@ -392,7 +509,8 @@ def merge_into_yearfile(new_df: pd.DataFrame, dest: Path, time_col: str,
 
 
 def split_and_write(df: pd.DataFrame, time_col: str, zone_col: str | None,
-                    out_dir: Path, prefix: str = "", force: bool = False) -> None:
+                    out_dir: Path, prefix: str = "", force: bool = False,
+                    window: tuple[str, str] | None = None) -> None:
     """Splitter df pr. (zone, år) og fletter ind i årsfilerne."""
     if df.empty:
         return
@@ -404,13 +522,15 @@ def split_and_write(df: pd.DataFrame, time_col: str, zone_col: str | None,
     if zone_col is None:
         for year, part in df.groupby("_year"):
             merge_into_yearfile(part.drop(columns=["_year"]),
-                                out_dir / f"{prefix}{int(year)}.csv", time_col, force)
+                                out_dir / f"{prefix}{int(year)}.csv", time_col,
+                                force, window)
     else:
         for (zone, year), part in df.groupby([zone_col, "_year"]):
             if pd.isna(zone) or pd.isna(year):
                 continue
             merge_into_yearfile(part.drop(columns=["_year"]),
-                                out_dir / f"{zone}_{int(year)}.csv", time_col, force)
+                                out_dir / f"{zone}_{int(year)}.csv", time_col,
+                                force, window)
 
 
 def find_last_date(folder: Path, time_col: str) -> date | None:
@@ -493,7 +613,8 @@ def update_spot(start: str, end: str, force: bool, source: str):
     if df.empty:
         print("    ingen data returneret")
         return
-    split_and_write(df, "hour_utc", "price_area", REPO_ROOT / "spot", force=force)
+    split_and_write(df, "hour_utc", "price_area", REPO_ROOT / "spot",
+                    force=force, window=(start, end))
 
 
 def _update_balance(name: str, sysapp_dataset: str, eds_endpoint: str,
@@ -516,7 +637,8 @@ def _update_balance(name: str, sysapp_dataset: str, eds_endpoint: str,
             df = normalize(fetch_sysapp("api_eds_balance.php", params), rename)
         else:
             df = fetch_eds(eds_endpoint, start, end, zone=zone)
-        split_and_write(df, "TimeUTC", "PriceArea", REPO_ROOT / out, force=force)
+        split_and_write(df, "TimeUTC", "PriceArea", REPO_ROOT / out,
+                        force=force, window=(start, end))
 
 
 def update_afrr(start, end, force, source):
@@ -544,6 +666,42 @@ def update_imbalance(start, end, force, source):
                     RENAME_IMBALANCE, MFRR_ZONES, "imbalance", start, end, force, source)
 
 
+def _derive_dmi_time(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Udled hour_utc og hour_dk af `unixtime` frem for at bruge API'ets egne.
+
+    api_dmi_obs_ny.php afleder felterne med CONVERT_TZ fra flertydig lokal tid.
+    Ved efterarsskiftet forekommer lokal 02:00 to gange, og begge far
+    hour_utc = "00:00:00" — den anden skulle vaere "01:00:00". Feltet er
+    altsa ikke unikt, og det er praecis det felt vi splitter aar og
+    deduplikerer pa.
+
+    Konsekvensen er malt: af fire leverede raekker hen over skiftet skrives
+    tre, og den overlevende baerer et forkert tidsstempel. At nogle pa
+    unixtime alene raekker ikke — sa star to raekker med samme hour_utc i
+    filen, og modellens loader laeser hour_utc.
+
+    `unixtime` er et heltal og immunt. Udleder vi selv, er etiketten korrekt
+    og unik, og dedup pa hour_utc bliver identisk med dedup pa unixtime.
+    Det gor os ogsa immune over for en fremtidig regression samme sted.
+    """
+    if df.empty or "unixtime" not in df.columns:
+        return df
+    df = df.copy()
+    ux = pd.to_numeric(df["unixtime"], errors="coerce")
+    if ux.isna().any():
+        raise ValueError(f"{int(ux.isna().sum())} raekker uden brugbar unixtime")
+    t = pd.to_datetime(ux.astype("int64"), unit="s", utc=True)
+    df["unixtime"] = ux.astype("int64")
+    df["hour_utc"] = t.dt.tz_localize(None).dt.strftime(TIME_FMT)
+    # NB: dmi/*.csv bruger mellemrum i hour_dk, mens balance-datasaettenes
+    # TimeDK bruger "T". Konventionen er ikke ens paa tvaers, saa den skal
+    # laeses af filerne og ikke antages.
+    df["hour_dk"] = (t.dt.tz_convert("Europe/Copenhagen").dt.tz_localize(None)
+                      .dt.strftime(TIME_FMT))
+    return df
+
+
 def update_dmi(start: str, end: str, force: bool, source: str):
     """
     DMI kommer altid fra sysapp — der findes ingen EDS-vej.
@@ -560,8 +718,9 @@ def update_dmi(start: str, end: str, force: bool, source: str):
         df = fetch_sysapp("api_dmi_obs_ny.php", {
             "startdate": start, "enddate": end, "area": area, "tz": "utc",
         })
+        df = _derive_dmi_time(df)
         split_and_write(df, "hour_utc", None, REPO_ROOT / "dmi",
-                        prefix=f"{area}_", force=force)
+                        prefix=f"{area}_", force=force, window=(start, end))
 
 
 # ============================================================================
