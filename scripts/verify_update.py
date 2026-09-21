@@ -62,6 +62,23 @@ REVISION_MAX = 1000          # ~2,5 doegn i kvarter; rummer --lookback=2
 # Alt andet — EUR, maengder, talformat, raekkefoelge — er stadig roedt.
 META_COLS = {"id", "created_at", "updated_at"}
 DKK_TOL = 0.1
+
+# Kursrevision (maalt 2026-09-21): DKK-kolonnen kan ogsaa aendre sig mere end
+# DKK_TOL, naar kilden har regnet et dansk leveringsdoegn om med en revideret
+# EUR/DKK-kurs. Spot 14/9 00:00-01:45 DK: 7,4748 -> 7,4753, EUR uaendret,
+# |Δ| op til 0,111 kr./MWh ved ~220 EUR. Det sker ved doegngraensen, fordi
+# filerne klippes ved UTC-midnat mens kursen gaelder pr. dansk doegn, og det vil
+# komme igen. Den absolutte graense er den forkerte maalestok ved priser paa
+# 1.500 kr./MWh; en kursrevision genkendes i stedet paa sin form:
+#   * EUR-parret (X_dkk/X_eur, XDKK/XEUR) er uaendret i de samme raekker
+#   * pr. dansk doegn: EN gammel og EN ny kurs forklarer alle aendrede raekker
+#     (restafvigelse |DKK - EUR*kurs| <= KURS_RES_TOL)
+#   * begge kurser ligger i ERM II-baandet, og springet er <= KURS_REL_TOL
+# Alt andet — EUR aendret, flere kurser samme doegn, spring > 0,1 % — er roedt.
+KURS_RES_TOL = 0.006         # halv enhed ved 2 decimaler (imbalance) + margen
+KURS_REL_TOL = 1e-3          # maalte spring: 2,7e-5 og 6,7e-5
+KURS_BAAND = (7.2925, 7.6282)  # ERM II: 7,46038 +/- 2,25 %
+KURS_MIN_EUR = 1.0           # kurs fittes kun paa raekker med |EUR| >= 1
 LOOKBACK_DAYS = 2            # skal matche update_data.py --lookback
 WINDOW_SLACK_DAYS = 1
 
@@ -101,6 +118,42 @@ def _is_dkk(col: str) -> bool:
     return col.endswith("DKK") or col.endswith("_dkk")
 
 
+def _eur_col(c: str, cols) -> str | None:
+    """EUR-parret til en DKK-kolonne, hvis det findes."""
+    e = (c[:-4] + "_eur") if c.endswith("_dkk") else (c[:-3] + "EUR")
+    return e if e in cols else None
+
+
+def _kursrevision(x: pd.Series, y: pd.Series, eur: pd.Series,
+                  t: pd.Series) -> tuple[str | None, str]:
+    """
+    Forklarer (x -> y) sig som EN kursrevision pr. dansk doegn?
+    Returnerer (beskrivelse, "") hvis ja, ellers (None, grund).
+    """
+    dag = (pd.to_datetime(t).dt.tz_localize("UTC")
+           .dt.tz_convert("Europe/Copenhagen").dt.date)
+    dele = []
+    for d, idx in dag.groupby(dag).groups.items():
+        xo, yn, e = x.loc[idx], y.loc[idx], eur.loc[idx]
+        stor = e.abs() >= KURS_MIN_EUR
+        if not stor.any():
+            if (yn - xo).abs().max() <= DKK_TOL:
+                continue
+            return None, f"{d}: ingen raekker med |EUR| >= {KURS_MIN_EUR} at fitte kursen paa"
+        ko = float((xo[stor] / e[stor]).median())
+        kn = float((yn[stor] / e[stor]).median())
+        rest = max(float((xo - e * ko).abs().max()), float((yn - e * kn).abs().max()))
+        if rest > KURS_RES_TOL:
+            return None, f"{d}: ikke en ensartet kurs (restafvigelse {rest:.3g})"
+        lo, hi = KURS_BAAND
+        if not (lo <= ko <= hi and lo <= kn <= hi):
+            return None, f"{d}: kurs {ko:.4f} -> {kn:.4f} uden for ERM II-baandet"
+        if abs(kn / ko - 1) > KURS_REL_TOL:
+            return None, f"{d}: kursspring {ko:.4f} -> {kn:.4f} > {KURS_REL_TOL:.1%}"
+        dele.append(f"{d} {ko:.4f}->{kn:.4f}")
+    return ("kurs " + ", ".join(dele) if dele else "kurs uaendret"), ""
+
+
 def _classify(repo: Path, path: str, start: pd.Timestamp | None) -> tuple[list[str], str]:
     """Returnerer (fejl, note) for en fil med fjernede linjer."""
     folder = path.split("/")[0]
@@ -132,6 +185,7 @@ def _classify(repo: Path, path: str, start: pd.Timestamp | None) -> tuple[list[s
         fejl.append(f"{path}: aendringer foer tilbageblikket "
                     f"({t.min()} < {start})")
     dkk_max = 0.0
+    kurser: list[str] = []
     for c in a.columns:
         m = diff[c]
         if not m.any() or c in META_COLS:
@@ -143,14 +197,32 @@ def _classify(repo: Path, path: str, start: pd.Timestamp | None) -> tuple[list[s
             if d <= DKK_TOL:
                 dkk_max = max(dkk_max, d)
                 continue
-            fejl.append(f"{path}: {c} aendret i {int(m.sum())} raekker, "
-                        f"max |Δ| {d:.4g} > {DKK_TOL}")
+            grund = f"max |Δ| {d:.4g} > {DKK_TOL}"
+            e = _eur_col(c, a.columns)
+            if e is None:
+                grund += ", intet EUR-par"
+            elif diff.loc[m, e].any():
+                grund += f", {e} ogsaa aendret"
+            else:
+                eur = pd.to_numeric(a.loc[m, e], errors="coerce")
+                if eur.isna().any():
+                    grund += f", {e} ikke numerisk"
+                else:
+                    tt = pd.Series(x.index.get_level_values(0), index=x.index)
+                    rev, hvorfor = _kursrevision(x, y, eur, tt)
+                    if rev is not None:
+                        dkk_max = max(dkk_max, d)
+                        kurser.append(f"{c}: {rev}")
+                        continue
+                    grund += f", ikke kursrevision: {hvorfor}"
+            fejl.append(f"{path}: {c} aendret i {int(m.sum())} raekker, {grund}")
         else:
             fejl.append(f"{path}: {c} aendret i {int(m.sum())} raekker "
                         f"(fx {a.loc[m, c].iloc[0]!r} -> {b.loc[m, c].iloc[0]!r})")
     note = (f"{path}: {int(aendret.sum())} raekker genhentet "
             f"({t.min():%Y-%m-%d} til {t.max():%Y-%m-%d}), kun metadata og "
-            f"DKK-omregning (max |Δ| {dkk_max:.3g})")
+            f"DKK-omregning (max |Δ| {dkk_max:.3g})"
+            + (f"; {'; '.join(kurser)}" if kurser else ""))
     return fejl, note
 
 
@@ -161,7 +233,8 @@ def check_no_deletions(repo: Path, r: Result) -> None:
     En opdatering tilfoejer. Sletter den, er det enten formatdrift eller en
     --force der har ramt bredere end vinduet — begge dele ser ud som gyldige
     filer bagefter. Undtagelserne: kildens revisioner i mfrr_act, og
-    genstempling/DKK-omregning af raekker i tilbageblikket (se ovenfor).
+    genstempling/DKK-omregning af raekker i tilbageblikket, herunder
+    kursrevisioner pr. dansk doegn (se ovenfor).
     """
     out = subprocess.run(["git", "diff", "--numstat", "--"] + DATA_DIRS,
                          cwd=repo, capture_output=True, text=True).stdout
@@ -349,8 +422,8 @@ def selftest(repo: Path) -> int:
 def _selftest_deletions(repo: Path) -> bool:
     """
     check_no_deletions laeser git, saa den testes i et lille git-repo med
-    spot, aFRR og DMI. Et tilfaelde skal vaere GROENT (den maalte genhentning
-    fra 2026-09-14); resten skal vaere roede.
+    spot, aFRR og DMI. To tilfaelde skal vaere GROENNE (den maalte genhentning
+    fra 2026-09-14 og kursrevisionen fra 2026-09-21); resten skal vaere roede.
     """
     import shutil
     import tempfile
@@ -365,6 +438,34 @@ def _selftest_deletions(repo: Path) -> bool:
         sp.loc[i[:100], "spot_price_dkk"] = _dkk(sp.loc[i[:100], "spot_price_dkk"], 0.05)
         j = af.index[-26:]
         af.loc[j, "UpPriceDKK"] = _dkk(af.loc[j, "UpPriceDKK"], 0.006)
+
+    def _kursraekker(sp):
+        # 8 raekker i tilbageblikket, samme danske doegn, |EUR| >= 60, saa
+        # et kursspring paa 0,002 giver |Δ| > DKK_TOL og rammer kursreglen
+        t = sp.iloc[-288:]
+        eur = pd.to_numeric(t.spot_price_eur)
+        dag = (pd.to_datetime(t.hour_utc).dt.tz_localize("UTC")
+               .dt.tz_convert("Europe/Copenhagen").dt.date)
+        ok = eur.abs() >= 60
+        bedst = dag[ok].value_counts().index[0]
+        i = t.index[ok & (dag == bedst)][:8]
+        assert len(i) == 8, "selftest: for faa raekker med |EUR| >= 60"
+        return i, eur.loc[i], pd.to_numeric(sp.loc[i, "spot_price_dkk"])
+
+    def kursrevision(sp, af):
+        # formen fra 2026-09-21: EUR uaendret, een ny kurs for doegnet
+        i, eur, dkk = _kursraekker(sp)
+        sp.loc[i, "spot_price_dkk"] = (eur * (dkk / eur + 0.002)).map(lambda v: f"{v:.6f}")
+        sp.loc[i, "updated_at"] = "2026-09-18 14:05:02"
+
+    def kurs_uensartet(sp, af):
+        i, eur, dkk = _kursraekker(sp)
+        fortegn = pd.Series([1, -1] * 4, index=i)
+        sp.loc[i, "spot_price_dkk"] = (eur * (dkk / eur + 0.002 * fortegn)).map(lambda v: f"{v:.6f}")
+
+    def kursspring(sp, af):
+        i, eur, dkk = _kursraekker(sp)
+        sp.loc[i, "spot_price_dkk"] = (dkk * 1.002).map(lambda v: f"{v:.6f}")
 
     def tabt_raekke(sp, af):
         sp.drop(sp.index[-50], inplace=True)
@@ -397,6 +498,9 @@ def _selftest_deletions(repo: Path) -> bool:
 
     tilfaelde = [
         ("genhentning 14/9 (skal vaere groen)", genhentning, False),
+        ("kursrevision 21/9 (skal vaere groen)", kursrevision, False),
+        ("kurs ikke ensartet i doegnet", kurs_uensartet, True),
+        ("kursspring > 0,1 %", kursspring, True),
         ("tabt raekke", tabt_raekke, True),
         ("DKK over tolerance", dkk_over_tol, True),
         ("EUR aendret", eur_aendret, True),
