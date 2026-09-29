@@ -342,23 +342,23 @@ def check_no_deletions(repo: Path, r: Result) -> None:
 def check_gaps(repo: Path, r: Result) -> None:
     """Intet hul stoerre end datasaettets eget skridt, bortset fra kendte."""
     kendte = {
-        ("dmi", "fyn"): ["2026-02-28", "2026-09-07"],
-        ("dmi", "vestkyst"): ["2026-02-28", "2026-09-07"],
-        # Begge zoner har hullet 2023-06-22 21:00 -> 2023-06-23 22:00, to
-        # doegn inde i serien. Undtagelsen stod oprindeligt kun paa DK1, saa
-        # DK2 var permanent roed — og en kontrol der altid er roed bliver
-        # ikke laest.
+        # Energinet mangler selv hele auktionsdoegnet 23. juni 2023 dansk tid
+        # (2023-06-22 21:00 -> 2023-06-23 22:00 UTC). Verificeret fravaerende
+        # hos EDS 2026-09-29, saa hullet kan ikke fyldes fra nogen kilde.
+        # Serien begynder 21. juni, og doegnene omkring hullet har alle 24
+        # raekker, saa det er et manglende doegn INDE i serien og ikke en
+        # seriestart. Undtagelsen er permanent og ufarlig: datoen ligger i
+        # fortiden, saa ingen fremtidige raekker lander der. Den stod
+        # oprindeligt kun paa DK1, saa DK2 var permanent roed.
+        # NB: doegnet har 23 timer. Bygger nogen en case i 2023, skal det
+        # haandteres; ingen kontrol raaber op om det.
         ("mfrr_cap", "DK1"): ["2023-06-22"],
         ("mfrr_cap", "DK2"): ["2023-06-22"],
 
-        # Kendte kildefejl, maalt 2026-09-09. Hverken aFRR-doegnet eller
-        # DMI-timerne lukkes ved genhentning.
-        #   afrr DK1: hele auktionsdoegnet 4. september mangler hos sysapp.
-        #   dmi: 4-5 timer om formiddagen 7. september i alle tre omraader.
-        # NB: undtagelser er permanente og skjuler ogsaa et fremtidigt hul paa
-        # samme dato. Fylder kilden dem, boer de fjernes igen.
-        ("afrr", "DK1"): ["2026-09-03"],
-        ("dmi", "karup"): ["2026-09-07"],
+        # Undtagelserne for afrr/DK1 2026-09-04 og for DMI 2026-02-28 og
+        # 2026-09-07 er fjernet 2026-09-29: sysapp har fyldt dem, og en
+        # undtagelse skjuler ogsaa et fremtidigt hul paa samme dato.
+        # Tilbage staar kun det doegn sysapp ikke har meldt fyldt.
     }
     for folder in DATA_DIRS:
         d = repo / folder
@@ -409,8 +409,9 @@ def check_mfrr_auction(repo: Path, r: Result) -> None:
         x = pd.read_csv(f, usecols=["TimeUTC"])
         t = pd.to_datetime(x["TimeUTC"], errors="coerce").dropna()
         pr = t.dt.date.value_counts().sort_index()
-        # foerste og sidste doegn kan vaere delvise; seriestarten i juni 2023
-        # er et kendt vilkaar og ikke en auction-kollision
+        # foerste og sidste doegn kan vaere delvise; det manglende
+        # auktionsdoegn 23. juni 2023 er en kildefejl hos Energinet og ikke en
+        # auction-kollision
         full = pr.iloc[1:-1] if len(pr) > 2 else pr
         full = full[[str(d) not in ("2023-06-22", "2023-06-23") for d in full.index]]
         afvig = full[full != 24]
