@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# cron_update.sh — daglig opdatering af df-data med commit kun ved groent lys.
+# cron_update.sh — ugentlig opdatering af df-data med commit kun ved groent lys.
 #
 # Committer ALDRIG uden at verify_update.py har svaret 0. Under manuel drift
 # er `git diff` reviewfladen; under cron er der ingen der laeser den, saa
 # kontrollen er det eneste der staar mellem en stille datafejl og repoet.
 #
-# Crontab (04:10 hver dag, efter EDS/sysapp har lukket doegnet):
-#   10 4 * * *  /sti/til/df-data/scripts/cron_update.sh >> /var/log/df-data.log 2>&1
+# Crontab (mandag 04:10, efter EDS/sysapp har lukket doegnet):
+#   10 4 * * 1  /sti/til/df-data/scripts/cron_update.sh >> /var/log/df-data.log 2>&1
 
 set -uo pipefail
 
@@ -48,6 +48,32 @@ git pull --ff-only origin "$BRANCH" || { echo "FEJL: pull fejlede"; exit 1; }
 # et ufuldstaendigt sidste doegn hentes faerdigt. Dedup goer det idempotent.
 if ! "$PY" scripts/update_data.py; then
     echo "FEJL: update_data.py fejlede — intet committet"
+    git checkout -- spot afrr mfrr_cap mfrr_act imbalance dmi 2>/dev/null
+    exit 1
+fi
+
+# Anden runde: genhentning af balancedata i et langt vindue.
+#
+# EDS reviderer og efterpublicerer sent — sysapp har maalt over 58 og over 72
+# timer efter driftstimen. Cron koerer UGENTLIGT, saa tilbageblikket skal daekke
+# intervallet PLUS forsinkelsen, ellers bliver en foreloebig raekke aldrig hentet
+# igen: 7 + 3 + margen = 14 doegn. Det var praecis den fejl der efterlod et tomt
+# kvarter 25. september 2026 uden et signal.
+#
+# Vinduet er naesten gratis i diffen: afrr, mfrr_cap, mfrr_act og imbalance har
+# ingen id/created_at/updated_at-kolonner, saa en uaendret raekke giver ingen
+# linje. Spot og dmi udelades — spot faar nyt id og updated_at ved hver
+# genhentning, og 14 doegn ville give ~2.700 genstemplede linjer pr. zone pr.
+# uge uden informationsvaerdi. Spot er desuden day-ahead og revideres ikke.
+#
+# LOOKBACK_BALANCE_DAYS i verify_update.py skal have samme vaerdi, ellers
+# afvises de genhentede raekker som "aendringer foer tilbageblikket".
+LOOKBACK_BALANCE="${DF_DATA_LOOKBACK_BALANCE:-14}"
+if ! "$PY" scripts/update_data.py \
+        --start "$(date -u -d "${LOOKBACK_BALANCE} days ago" +%F)" \
+        --end "$(date -u -d 'yesterday' +%F)" \
+        --force --skip spot,dmi; then
+    echo "FEJL: genhentning af balancedata fejlede — intet committet"
     git checkout -- spot afrr mfrr_cap mfrr_act imbalance dmi 2>/dev/null
     exit 1
 fi

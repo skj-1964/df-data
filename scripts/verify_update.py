@@ -63,6 +63,52 @@ REVISION_MAX = 1000          # ~2,5 doegn i kvarter; rummer --lookback=2
 META_COLS = {"id", "created_at", "updated_at"}
 DKK_TOL = 0.1
 
+# Balancedata revideres sent. Sysapp har maalt EDS publicere over 58 og over 72
+# timer efter driftstimen (svar 2026-09-29), og cron koerer UGENTLIGT. Et
+# tilbageblik skal derfor daekke cron-intervallet PLUS forsinkelsen, ellers bliver
+# en foreloebig raekke aldrig hentet igen: 7 + 3 + margen = 14 doegn. Det er
+# naesten gratis i diffen, fordi de fire balancefiler ikke har id/updated_at, saa
+# en uaendret raekke giver ingen linje. Spot har dem, og et 14-doegns vindue der
+# ville give ~2.700 genstemplede linjer pr. zone pr. uge uden informationsvaerdi.
+BALANCE_DIRS = {"afrr", "mfrr_cap", "mfrr_act", "imbalance"}
+LOOKBACK_BALANCE_DAYS = 14   # skal matche cron_update.sh
+LOOKBACK_DAYS = 2            # skal matche update_data.py --lookback (spot, dmi)
+WINDOW_SLACK_DAYS = 1
+
+# EDS' nyeste kvarterer er foreloebige: priskolonner tomme, aFRR-maengder 0,00.
+# Bekraeftet af sysapp 2026-09-29 som kildens normaltilstand, ikke en fejl — den
+# forsvinder naar raekken hentes igen. Kontroller derfor kun aeldre raekker, og
+# lad et hul i den friske ende vaere en note indtil det er gammelt nok til at
+# vaere en fejl. GRACE_DAYS skal vaere mindre end genhentningsvinduet, ellers
+# kan et noteret hul aldrig blive hentet igen.
+PROVISIONAL_DAYS = 4
+GRACE_DAYS = 4
+
+# Kontrollen for tomme raekker. Spot er ikke med: en spotpris paa praecis 0 er en
+# rigtig markedspris, og der er 1.359 af dem i historikken.
+TOMME_DIRS = {"afrr", "mfrr_cap", "mfrr_act", "imbalance", "dmi"}
+NOEGLE_COLS = {"TimeUTC", "TimeDK", "PriceArea", "hour_utc", "hour_dk",
+               "price_area", "area", "unixtime", "id", "created_at", "updated_at"}
+# Bekraeftede undtagelser, alle i fortiden, saa de kan ikke skjule en fremtidig
+# fejl paa samme dato.
+#   afrr/DK1: sysapp har verificeret de 19 raekker mod EDS — identiske, aegte
+#             nul-efterspoergsel i et marked under opbygning.
+#   dmi/fyn:  to timer uden observationer fra stationen, 2023-04-22.
+TOMME_UNDTAGELSER = {
+    ("afrr", "DK1"): {"2024-10-01", "2024-10-02", "2025-03-26", "2025-03-27"},
+    ("dmi", "fyn"): {"2023-04-22"},
+}
+
+# Serier pipelinen vedligeholder. spot/DE, NO2, SE3, SE4 og SYSTEM er rester fra
+# en engangsanalyse; de stopper 2025-09-30, og PRICE_ZONES i update_data.py
+# indeholder kun DK1 og DK2. En aargraensekontrol paa dem ville vaere permanent
+# roed.
+VEDLIGEHOLDTE = {
+    "spot": {"DK1", "DK2"}, "afrr": {"DK1"}, "mfrr_cap": {"DK1", "DK2"},
+    "mfrr_act": {"DK1", "DK2"}, "imbalance": {"DK1", "DK2"},
+    "dmi": {"fyn", "vestkyst", "karup"},
+}
+
 # Kursrevision (maalt 2026-09-21): DKK-kolonnen kan ogsaa aendre sig mere end
 # DKK_TOL, naar kilden har regnet et dansk leveringsdoegn om med en revideret
 # EUR/DKK-kurs. Spot 14/9 00:00-01:45 DK: 7,4748 -> 7,4753, EUR uaendret,
@@ -79,8 +125,9 @@ KURS_RES_TOL = 0.006         # halv enhed ved 2 decimaler (imbalance) + margen
 KURS_REL_TOL = 1e-3          # maalte spring: 2,7e-5 og 6,7e-5
 KURS_BAAND = (7.2925, 7.6282)  # ERM II: 7,46038 +/- 2,25 %
 KURS_MIN_EUR = 1.0           # kurs fittes kun paa raekker med |EUR| >= 1
-LOOKBACK_DAYS = 2            # skal matche update_data.py --lookback
-WINDOW_SLACK_DAYS = 1
+
+
+_USAT = object()      # "endnu ikke beregnet", til forskel fra "findes ikke"
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -94,8 +141,8 @@ def _head_csv(repo: Path, path: str) -> pd.DataFrame:
                        dtype=str, keep_default_na=False)
 
 
-def _window_start(repo: Path) -> pd.Timestamp | None:
-    """Samme regel som update_data.determine_start, men paa HEAD."""
+def _frontier(repo: Path) -> pd.Timestamp | None:
+    """Seneste doegn i spot og dmi paa HEAD — udgangspunkt for vinduet."""
     seneste = []
     for folder in ("spot", "dmi"):
         m = None
@@ -111,7 +158,22 @@ def _window_start(repo: Path) -> pd.Timestamp | None:
             seneste.append(m.normalize())
     if not seneste:
         return None
-    return min(seneste) - pd.Timedelta(days=LOOKBACK_DAYS + WINDOW_SLACK_DAYS)
+    return min(seneste)
+
+
+def _window_start(base: pd.Timestamp | None, folder: str) -> pd.Timestamp | None:
+    """
+    Hvor langt tilbage maa en aendring ligge for denne mappe.
+
+    Balancedata genhentes i et langt vindue, fordi kilden reviderer sent; spot og
+    dmi kun i det korte. Vinduet foelger derfor mappen og ikke koerslen — ellers
+    skulle graensen saettes efter det loseste datasaet, og vaernet mod en --force
+    der ramte for bredt ville blive tilsvarende slapt for spot.
+    """
+    if base is None:
+        return None
+    dage = LOOKBACK_BALANCE_DAYS if folder in BALANCE_DIRS else LOOKBACK_DAYS
+    return base - pd.Timedelta(days=dage + WINDOW_SLACK_DAYS)
 
 
 def _is_dkk(col: str) -> bool:
@@ -154,9 +216,10 @@ def _kursrevision(x: pd.Series, y: pd.Series, eur: pd.Series,
     return ("kurs " + ", ".join(dele) if dele else "kurs uaendret"), ""
 
 
-def _classify(repo: Path, path: str, start: pd.Timestamp | None) -> tuple[list[str], str]:
+def _classify(repo: Path, path: str, base: pd.Timestamp | None) -> tuple[list[str], str]:
     """Returnerer (fejl, note) for en fil med fjernede linjer."""
     folder = path.split("/")[0]
+    start = _window_start(base, folder)
     old = _head_csv(repo, path)
     new = pd.read_csv(repo / path, dtype=str, keep_default_na=False)
     fejl = []
@@ -242,7 +305,7 @@ def check_no_deletions(repo: Path, r: Result) -> None:
         r.note("ingen aendringer i datafilerne")
         return
     bad, noter = [], []
-    start = None
+    base = _USAT
     for line in out.strip().splitlines():
         add, rem, path = line.split("\t")
         if rem == "0" or rem == "-":
@@ -257,9 +320,9 @@ def check_no_deletions(repo: Path, r: Result) -> None:
         if path.split("/")[0] in REVISION_DATASETS and int(rem) <= REVISION_MAX:
             noter.append(f"{path}: {rem} raekker revideret af kilden")
             continue
-        if start is None:
-            start = _window_start(repo)
-        fejl, note = _classify(repo, path, start)
+        if base is _USAT:
+            base = _frontier(repo)
+        fejl, note = _classify(repo, path, base)
         if fejl:
             bad.extend(fejl)
         else:
@@ -311,11 +374,23 @@ def check_gaps(repo: Path, r: Result) -> None:
             g = t.diff()
             step = g.mode().iloc[0]
             bad = g[g > max(step, pd.Timedelta("1h"))]
+            nyeste = t.max()
             for i in bad.index:
-                start = str(t.loc[:i].iloc[-2])[:10]
-                if start in kendte.get((folder, key), []):
+                hul_start = t.loc[:i].iloc[-2]
+                if str(hul_start)[:10] in kendte.get((folder, key), []):
                     continue
-                r.fail(f"{folder}/{f.name}: hul {t.loc[:i].iloc[-2]} -> {t.loc[i]}")
+                besked = f"{folder}/{f.name}: hul {hul_start} -> {t.loc[i]}"
+                # Et hul i den friske ende er formentlig kildens forsinkelse og
+                # bliver fyldt af naeste genhentning. Det er en note, ikke en
+                # fejl — men kun indtil det er aeldre end naadeperioden, saa
+                # bliver det roedt af sig selv. Uden den graense stopper cron
+                # hver gang afregningsdata er sent; uden eskaleringen bliver et
+                # aegte hul aldrig roedt.
+                if nyeste - hul_start <= pd.Timedelta(days=GRACE_DAYS):
+                    r.note(besked + f" (inden for {GRACE_DAYS} doegn af "
+                                    "seneste raekke — kontrolleres igen naeste koersel)")
+                    continue
+                r.fail(besked)
 
 
 def check_mfrr_auction(repo: Path, r: Result) -> None:
@@ -362,6 +437,105 @@ def check_dmi_axis(repo: Path, r: Result) -> None:
         r.ok("dmi: hour_utc stemmer med unixtime overalt")
 
 
+
+def _vaerdikolonner(df: pd.DataFrame) -> list[str]:
+    return [c for c in df.columns if c not in NOEGLE_COLS]
+
+
+def check_tomme_raekker(repo: Path, r: Result) -> None:
+    """
+    Ingen raekke hvor ALLE vaerdikolonner er NaN eller 0.
+
+    Det er den fejl ingen anden kontrol kan se. Den 25. september 2026 stod et
+    enkelt kvarter tomt i alle fire kvartersserier, uden hul ved siden af:
+    noeglen findes, saa check_gaps er tilfreds, og det er en tilfoejelse, saa
+    check_no_deletions er tilfreds. Den blev kun fundet, fordi hele ugen bagefter
+    blev sammenlignet mod EDS kolonne for kolonne. I modellen ser en aFRR-pris
+    paa 0 ud som en billig mulighed, ikke som manglende data, og en tom
+    ubalancepris bryder den nul-NaN-kontrakt forbrugersiden er verificeret paa.
+
+    Maalt paa historikken: ingen fortilfaelde i imbalance (0 af 110.112),
+    mfrr_act (0 af 110.216) eller mfrr_cap (0 af 57.364). De to serier der HAR
+    fortilfaelde staar i TOMME_UNDTAGELSER, begge verificerede.
+
+    Raekker inden for PROVISIONAL_DAYS af filens nyeste raekke kontrolleres ikke:
+    dér er tomme priskolonner kildens egen foreloebige tilstand.
+    """
+    fundet = False
+    for folder in sorted(TOMME_DIRS):
+        d = repo / folder
+        if not d.exists():
+            continue
+        tc = tcol_for(folder)
+        for f in sorted(d.glob("*.csv")):
+            key = f.stem.rsplit("_", 1)[0]
+            x = pd.read_csv(f, low_memory=False)
+            cols = _vaerdikolonner(x)
+            if not cols or tc not in x.columns:
+                continue
+            t = pd.to_datetime(x[tc], errors="coerce")
+            v = x[cols].apply(pd.to_numeric, errors="coerce")
+            tom = (v.isna() | (v == 0)).all(axis=1) & t.notna()
+            if t.notna().any():
+                tom &= t <= t.max() - pd.Timedelta(days=PROVISIONAL_DAYS)
+            undt = TOMME_UNDTAGELSER.get((folder, key), set())
+            if undt:
+                tom &= ~t.dt.strftime("%Y-%m-%d").isin(undt)
+            if tom.any():
+                fundet = True
+                r.fail(f"{folder}/{f.name}: {int(tom.sum())} raekker uden vaerdier "
+                       f"(foerste: {t[tom].iloc[0]})")
+    if not fundet:
+        r.ok(f"ingen tomme raekker i {', '.join(sorted(TOMME_DIRS))} "
+             f"(uden for de seneste {PROVISIONAL_DAYS} doegn)")
+
+
+def check_aargraenser(repo: Path, r: Result) -> None:
+    """
+    Aarsfilerne skal haenge sammen hen over aarsskiftet.
+
+    check_gaps maaler spring INDE i en fil. En fil der starter for sent har ingen
+    spring, saa et hul paa aarsgraensen er usynligt — og en aegte seriestart og
+    manglende foerste timer ser fuldstaendig ens ud. Sysapp fandt paa den maade
+    2026-01-01 00:00-01:00 i fyn og vestkyst, som vores egen kortlaegning ikke
+    saa, netop fordi den maalte pr. fil.
+
+    Kun aar der foelger umiddelbart paa hinanden sammenlignes, saa en serie der
+    begynder midt i et aar (mfrr_cap juni 2023, afrr oktober 2024, mfrr_act og
+    imbalance marts 2025) ikke rapporteres som et hul.
+    """
+    import re
+    for folder, noegler in sorted(VEDLIGEHOLDTE.items()):
+        d = repo / folder
+        if not d.exists():
+            continue
+        tc = tcol_for(folder)
+        grupper: dict[str, dict[int, Path]] = {}
+        for f in sorted(d.glob("*.csv")):
+            m = re.match(r"(.+)_(\d{4})$", f.stem)
+            if m and m.group(1) in noegler:
+                grupper.setdefault(m.group(1), {})[int(m.group(2))] = f
+        for key, aar in sorted(grupper.items()):
+            ys = sorted(aar)
+            for y0, y1 in zip(ys, ys[1:]):
+                if y1 != y0 + 1:
+                    r.fail(f"{folder}/{key}: aarsfil mangler mellem {y0} og {y1}")
+                    continue
+                t0 = pd.to_datetime(pd.read_csv(aar[y0], usecols=[tc])[tc],
+                                    errors="coerce").dropna()
+                t1 = pd.to_datetime(pd.read_csv(aar[y1], usecols=[tc])[tc],
+                                    errors="coerce").dropna().sort_values()
+                if t0.empty or t1.empty:
+                    continue
+                step = t1.drop_duplicates().diff().mode()
+                step = step.iloc[0] if len(step) else pd.Timedelta("1h")
+                spring = t1.min() - t0.max()
+                if spring > max(step, pd.Timedelta("1h")):
+                    r.fail(f"{folder}/{key}: hul paa aarsgraensen "
+                           f"{t0.max()} -> {t1.min()} (spring {spring})")
+                else:
+                    r.ok(f"{folder}/{key} {y0}->{y1}: aarsgraensen haenger sammen")
+
 # Spot-praecisionen kontrolleres IKKE. Sysapp gemte spot afrundet til to
 # decimaler frem til et sted mellem 12. august og 6. september 2026 og har ikke
 # backfillet, saa en kontrol af hele serien ville vaere permanent roed. Maalt
@@ -378,6 +552,8 @@ def check_dmi_axis(repo: Path, r: Result) -> None:
 CHECKS = [
     ("ingen slettede linjer", check_no_deletions),
     ("ingen uventede huller", check_gaps),
+    ("ingen tomme raekker", check_tomme_raekker),
+    ("aargraenser", check_aargraenser),
     ("mfrr_cap auction", check_mfrr_auction),
     ("dmi-akse", check_dmi_axis),
 ]
@@ -388,32 +564,82 @@ def selftest(repo: Path) -> int:
     Fremkald hver kontrol som roed. En groen kontrol er ikke et bevis foer
     man har set den kunne blive roed.
     """
+    import contextlib
+    import io as _io
     import shutil
     import tempfile
     print("=== selftest: hver kontrol skal kunne fejle ===")
     alle_ok = True
-    sabotager = [
-        ("ingen uventede huller", "dmi/karup_2026.csv", "drop"),
-        ("mfrr_cap auction", "mfrr_cap/DK1_2026.csv", "drop"),
-        ("dmi-akse", "dmi/fyn_2026.csv", "shift"),
-    ]
-    for navn, fil, hvordan in sabotager:
+
+    def _kopi(base: Path) -> Path:
         tmp = Path(tempfile.mkdtemp()) / "repo"
-        shutil.copytree(repo, tmp, ignore=shutil.ignore_patterns(".git"))
-        p = tmp / fil
-        x = pd.read_csv(p, dtype=str, keep_default_na=False)
-        if hvordan == "drop":
-            x = x.drop(x.index[len(x) // 2])
-        elif hvordan == "shift":
-            x["hour_utc"] = (pd.to_datetime(x.hour_utc) + pd.Timedelta("1h")
-                             ).dt.strftime("%Y-%m-%d %H:%M:%S")
-        x.to_csv(p, index=False)
-        fn = dict(CHECKS)[navn]
+        shutil.copytree(base, tmp, ignore=shutil.ignore_patterns(".git"))
+        return tmp
+
+    def _koer(fn, sti: Path) -> set[str]:
         r = Result()
-        fn(tmp, r)
-        status = "ROED (godt)" if r.fails else "GROEN — kontrollen maaler ingenting"
-        print(f"  {navn:24s} {status}")
-        alle_ok &= bool(r.fails)
+        with contextlib.redirect_stdout(_io.StringIO()):
+            fn(sti, r)
+        return set(r.fails)
+
+    def drop_midt(x, tc):
+        return x.drop(x.index[len(x) // 2])
+
+    def drop_frisk(x, tc):
+        # hul 20-30 raekker fra enden: inden for GRACE_DAYS, skal vaere en note
+        return x.drop(x.index[-30:-20])
+
+    def skift_tid(x, tc):
+        x[tc] = (pd.to_datetime(x[tc]) + pd.Timedelta("1h")
+                 ).dt.strftime("%Y-%m-%d %H:%M:%S")
+        return x
+
+    def tom_gammel(x, tc):
+        for c in _vaerdikolonner(x):
+            x.loc[x.index[len(x) // 2], c] = "0"
+        return x
+
+    def tom_frisk(x, tc):
+        # samme sabotage paa den nyeste raekke: kildens foreloebige tilstand,
+        # skal IKKE vaere en fejl
+        for c in _vaerdikolonner(x):
+            x.loc[x.index[-1], c] = "0"
+        return x
+
+    def klip_aarsstart(x, tc):
+        return x.drop(x.index[:3])
+
+    # (kontrol, fil, sabotage, skal tilfoeje en fejl)
+    sabotager = [
+        ("ingen uventede huller", "dmi/karup_2026.csv", drop_midt, True),
+        ("ingen uventede huller", "dmi/karup_2026.csv", drop_frisk, False),
+        ("ingen tomme raekker", "imbalance/DK1_2026.csv", tom_gammel, True),
+        ("ingen tomme raekker", "imbalance/DK1_2026.csv", tom_frisk, False),
+        ("aargraenser", "dmi/karup_2026.csv", klip_aarsstart, True),
+        ("mfrr_cap auction", "mfrr_cap/DK1_2026.csv", drop_midt, True),
+        ("dmi-akse", "dmi/fyn_2026.csv", skift_tid, True),
+    ]
+    for navn, fil, sabotage, skal_fejle in sabotager:
+        fn = dict(CHECKS)[navn]
+        tmp = _kopi(repo)
+        # Maal DELTA mod en ren kopi. Nogle kontroller er roede paa rigtige data
+        # (et endnu ikke fyldt hul), og en test der bare spoerger "er der fejl?"
+        # ville da bestaa uden at sabotagen gjorde noget som helst.
+        foer = _koer(fn, tmp)
+        sti = tmp / fil
+        x = pd.read_csv(sti, dtype=str, keep_default_na=False)
+        x = sabotage(x, tcol_for(fil.split("/")[0]))
+        x.to_csv(sti, index=False)
+        nye = _koer(fn, tmp) - foer
+        godt = bool(nye) == skal_fejle
+        forventet = "NY FEJL" if skal_fejle else "uaendret"
+        print(f"  {navn:24s} {sabotage.__name__:14s} "
+              f"{'ny fejl' if nye else 'uaendret':9s} "
+              f"({'godt' if godt else 'FORKERT, forventet ' + forventet})")
+        if not godt:
+            for x_ in nye:
+                print(f"      {x_}")
+        alle_ok &= godt
         shutil.rmtree(tmp.parent, ignore_errors=True)
     alle_ok &= _selftest_deletions(repo)
     return 0 if alle_ok else 1

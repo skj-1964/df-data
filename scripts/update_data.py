@@ -77,6 +77,7 @@ EDS_PAUSE_SEC = {"Elspotprices": 330.0}
 EDS_PAUSE_DEFAULT = 20.0
 _eds_last_call: dict[str, float] = {}
 PAGE_LIMIT  = 10000          # sysapp's loft; EDS bruger 5000
+MAX_AUTO_WINDOW_DAYS = 45   # loft for det vindue determine_start selv udleder
 MAX_PAGES   = 500            # sikkerhedsstop mod uendelig paginering
 
 USER_AGENT = "df-data-updater/2.0 (skj-1964/df-data)"
@@ -786,13 +787,31 @@ def determine_start(args) -> str:
     """
     if args.start:
         return args.start
-    candidates = []
-    for folder, tc in [("spot", "hour_utc"), ("dmi", "hour_utc")]:
+    # ALLE seks datasaet, ikke kun spot og dmi. Spot er day-ahead og dermed
+    # altid det friskeste; dmi er observationer og haenger timer bagud.
+    # Balancedata haenger DOEGN bagud — sysapp har maalt EDS publicere over 58 og
+    # over 72 timer efter driftstimen. Regnes fronten kun af de to friskeste,
+    # bliver startdatoen systematisk for sen for de fire andre, og deres hale
+    # bliver aldrig hentet. Det var aarsagen til hullet 25. september 2026 og
+    # samme fejlklasse som sysapps eget udfald den 28.
+    kandidater = []
+    for folder, tc in [("spot", "hour_utc"), ("afrr", "TimeUTC"),
+                       ("mfrr_cap", "TimeUTC"), ("mfrr_act", "TimeUTC"),
+                       ("imbalance", "TimeUTC"), ("dmi", "hour_utc")]:
         d = find_last_date(REPO_ROOT / folder, tc)
         if d:
-            candidates.append(d)
-    if candidates:
-        return (min(candidates) - timedelta(days=args.lookback)).isoformat()
+            kandidater.append((d, folder))
+    if kandidater:
+        aeldste, bagest = min(kandidater)
+        start = aeldste - timedelta(days=args.lookback)
+        # Et datasaet der er holdt op med at blive publiceret ville ellers
+        # traekke vinduet laengere tilbage for hver koersel, i det uendelige.
+        gulv = date.today() - timedelta(days=MAX_AUTO_WINDOW_DAYS)
+        if start < gulv:
+            print(f"    ADVARSEL: '{bagest}' haenger bagud til {aeldste}; "
+                  f"vinduet klippes til {gulv}. Brug --start for at hente mere.")
+            start = gulv
+        return start.isoformat()
     return (date.today() - timedelta(days=3 * 365)).isoformat()
 
 
@@ -810,7 +829,8 @@ def main() -> int:
                    help="Komma-separeret liste af datasæt at springe over")
     p.add_argument("--lookback", type=int, default=2,
                    help="Doegn tilbage fra seneste raekke naar --start udelades "
-                        "(default: 2). Se determine_start.")
+                        "(default: 2). Se determine_start. Balancedata genhentes "
+                        "i et laengere vindue af cron_update.sh, ikke herfra.")
     p.add_argument("--zones", default="",
                    help="Komma-separeret liste, fx DK1,DK2. Overskriver "
                         "PRICE_ZONES for denne koersel.")
