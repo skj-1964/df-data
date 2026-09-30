@@ -4,7 +4,7 @@ Dette dokument viser den aktuelle datadækning i repo'et. Opdateres af `scripts/
 
 ## Seneste opdatering
 
-**2026-09-29** — automatisk opdatering (kilde: `sysapp`)
+**2026-09-30** — automatisk opdatering (kilde: `sysapp`)
 
 ## Dækning pr. dataset
 
@@ -73,6 +73,11 @@ Dette dokument viser den aktuelle datadækning i repo'et. Opdateres af `scripts/
 | dmi | karup | 2024-01-01 00:00:00 | 2024-12-31 23:00:00 | 8,784 |
 | dmi | karup | 2025-01-01 00:00:00 | 2025-12-31 23:00:00 | 8,760 |
 | dmi | karup | 2026-01-01 00:00:00 | 2026-09-28 23:00:00 | 6,504 |
+| dmi | ringsted | 2022-12-31 00:00:00 | 2022-12-31 23:00:00 | 24 |
+| dmi | ringsted | 2023-01-01 00:00:00 | 2023-12-31 23:00:00 | 8,760 |
+| dmi | ringsted | 2024-01-01 00:00:00 | 2024-12-31 23:00:00 | 8,784 |
+| dmi | ringsted | 2025-01-01 00:00:00 | 2025-12-31 23:00:00 | 8,760 |
+| dmi | ringsted | 2026-01-01 00:00:00 | 2026-09-29 23:00:00 | 6,528 |
 | dmi | vestkyst | 2022-12-31 23:00:00 | 2022-12-31 23:00:00 | 1 |
 | dmi | vestkyst | 2023-01-01 00:00:00 | 2023-12-31 23:00:00 | 8,760 |
 | dmi | vestkyst | 2024-01-01 00:00:00 | 2024-12-31 23:00:00 | 8,784 |
