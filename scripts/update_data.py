@@ -56,7 +56,7 @@ BASE_URL_EDS    = "https://api.energidataservice.dk/dataset"
 PRICE_ZONES = ["DK1", "DK2"]
 AFRR_ZONES  = ["DK1"]                        # DK2 har endnu ikke aFRR-marked
 MFRR_ZONES  = ["DK1", "DK2"]
-DMI_AREAS   = ["fyn", "vestkyst", "karup"]
+DMI_AREAS   = ["fyn", "vestkyst", "karup", "ringsted"]
 
 # sysapp's api_energinet_prices.php kender kun DK1/DK2. De øvrige zoner i
 # spot/ (DE, NO2, SE3, SE4, SYSTEM) stammer fra EDS' gamle Elspotprices og
@@ -703,9 +703,14 @@ def _derive_dmi_time(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def update_dmi(start: str, end: str, force: bool, source: str):
+def update_dmi(start: str, end: str, force: bool, source: str,
+               areas: list[str] | None = None):
     """
     DMI kommer altid fra sysapp — der findes ingen EDS-vej.
+
+    `areas` (default: alle i DMI_AREAS) lader et enkelt omraade hentes alene,
+    fx ved fyldning af historik for et nyt omraade, uden at de andre filer
+    roeres. Se --dmi-areas.
 
     NB: tidligere sendte scriptet 'shortname=all'. Den parameter findes ikke i
     api_dmi_obs_ny.php's kontrakt (den hedder 'fields'), og endpointet
@@ -714,8 +719,10 @@ def update_dmi(start: str, end: str, force: bool, source: str):
     dmi/*.csv. Adfærden er bevaret uændret her — at sætte fields=all ville
     tilføje to kolonner midt i historikken og er en selvstændig beslutning.
     """
+    if areas is None:
+        areas = DMI_AREAS
     print("  dmi (sysapp):")
-    for area in DMI_AREAS:
+    for area in areas:
         df = fetch_sysapp("api_dmi_obs_ny.php", {
             "startdate": start, "enddate": end, "area": area, "tz": "utc",
         })
@@ -834,7 +841,19 @@ def main() -> int:
     p.add_argument("--zones", default="",
                    help="Komma-separeret liste, fx DK1,DK2. Overskriver "
                         "PRICE_ZONES for denne koersel.")
+    p.add_argument("--dmi-areas", default="",
+                   help="Komma-separeret liste af DMI-omraader, fx ringsted. "
+                        f"Default: alle ({','.join(DMI_AREAS)}). De oevrige "
+                        "omraaders filer roeres ikke.")
     args = p.parse_args()
+
+    dmi_areas = None
+    if args.dmi_areas:
+        dmi_areas = [a.strip() for a in args.dmi_areas.split(",") if a.strip()]
+        ukendte = [a for a in dmi_areas if a not in DMI_AREAS]
+        if ukendte:
+            print(f"FEJL: ukendte DMI-omraader {ukendte}; kendte: {DMI_AREAS}")
+            return 2
 
     if args.zones:
         globals()["PRICE_ZONES"] = [z.strip() for z in args.zones.split(",")
@@ -848,6 +867,7 @@ def main() -> int:
     print(f"Kilde:   {args.source}")
     print(f"Periode: {start} → {end} (inklusiv)")
     print(f"Zoner:   {PRICE_ZONES}")
+    print(f"DMI:     {dmi_areas if dmi_areas is not None else DMI_AREAS}")
     if skip:
         print(f"Springer over: {sorted(skip)}")
     print()
@@ -872,7 +892,7 @@ def main() -> int:
     if "mfrr_cap" not in skip:  update_mfrr_cap(start, end, args.force, args.source)
     if "mfrr_act" not in skip:  update_mfrr_act(start, end, args.force, args.source)
     if "imbalance" not in skip: update_imbalance(start, end, args.force, args.source)
-    if "dmi" not in skip:       update_dmi(start, end, args.force, args.source)
+    if "dmi" not in skip:       update_dmi(start, end, args.force, args.source, dmi_areas)
 
     print()
     update_version_file(args.source)

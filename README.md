@@ -19,7 +19,7 @@ df-data/
 ├── imbalance/   — Ubalancepris + aFRR aktiverede VWA-priser (15-min)
 │   └── DK{1,2}_{år}.csv
 ├── dmi/         — DMI vejrobservationer (timeopløst)
-│   └── {område}_{år}.csv             (område fx 'fyn', 'vestkyst')
+│   └── {område}_{år}.csv             (fyn, vestkyst, karup, ringsted)
 └── scripts/
     └── update_data.py                — Henter ny måned fra API og opdaterer repo
 ```
@@ -36,7 +36,7 @@ Aktuelle dækningsgrænser (se `DATA_VERSION.md` for præcise datoer pr. kørsel
 | mfrr_cap | DK1, DK2 | 2023-06 → løbende |
 | mfrr_act | DK1, DK2 | 2025-03 → løbende |
 | imbalance | DK1, DK2 | 2025-03 → løbende |
-| dmi | fyn, vestkyst | 2023-01 → løbende |
+| dmi | fyn, vestkyst, karup, ringsted | 2023-01 → løbende (ringsted hentet 2026-09-30, samme dybde) |
 
 Energinet leverer typisk ny data med få dages forsinkelse for spot/aFRR/mFRR, mens mfrr_act og imbalance som 15-min-datasæt først blev publiceret fra marts 2025. aFRR-markedet i DK1 startede oktober 2024.
 
@@ -78,6 +78,19 @@ precip_past1h, pressure, humidity_past1h
 ```
 
 Alle vejrvariable er bevaret, ikke kun temperatur — solindstråling og vindhastighed er relevante for værker med solfangere eller luft-vand varmepumper.
+
+### DMI-områder
+
+Et område er ikke én station, men et gennemsnit over de synop-stationer sysapp har knyttet til området (stationslisten står i sysapps cron, ikke i dette repo). Vælg det område, der ligger nærmest værket:
+
+| Område | DMI-stationer (id, navn) | Dækker |
+|---|---|---|
+| `fyn` | 06102, 05400, 06108, 06123, 05220, 06120 | Fyn |
+| `vestkyst` | 06041, 06058, 06080 | Vestjylland, Esbjerg–Thyborøn |
+| `karup` | 06060, 06068 | Midtjylland |
+| `ringsted` | 06174 Tessebølle, 06154 Brandelev, 06170 Roskilde Lufthavn, 06135 Flakkebjerg | Sjælland og øerne — værker øst for Storebælt |
+
+Der findes ingen DMI-station i selve Ringsted; de fire stationer omkranser byen inden for 29 km. Skydække for `ringsted` kom 2022–23 kun fra Roskilde og Flakkebjerg, fra 2024 også Brandelev.
 
 ## Brug
 

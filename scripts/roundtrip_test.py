@@ -58,6 +58,7 @@ def _rebuild_cases() -> None:
     ("dmi", "fyn_2026.csv", "hour_utc", {}, []),
     ("dmi", "karup_2026.csv", "hour_utc", {}, []),
     ("dmi", "vestkyst_2026.csv", "hour_utc", {}, []),
+    ("dmi", "ringsted_2026.csv", "hour_utc", {}, []),
     ]
     yr = MONTH[:4]
     CASES = [(f, n.replace("2026", yr), t, r, e) for f, n, t, r, e in CASES]

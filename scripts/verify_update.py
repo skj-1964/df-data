@@ -106,7 +106,7 @@ TOMME_UNDTAGELSER = {
 VEDLIGEHOLDTE = {
     "spot": {"DK1", "DK2"}, "afrr": {"DK1"}, "mfrr_cap": {"DK1", "DK2"},
     "mfrr_act": {"DK1", "DK2"}, "imbalance": {"DK1", "DK2"},
-    "dmi": {"fyn", "vestkyst", "karup"},
+    "dmi": {"fyn", "vestkyst", "karup", "ringsted"},
 }
 
 # Kursrevision (maalt 2026-09-21): DKK-kolonnen kan ogsaa aendre sig mere end
@@ -617,6 +617,8 @@ def selftest(repo: Path) -> int:
         ("ingen tomme raekker", "imbalance/DK1_2026.csv", tom_gammel, True),
         ("ingen tomme raekker", "imbalance/DK1_2026.csv", tom_frisk, False),
         ("aargraenser", "dmi/karup_2026.csv", klip_aarsstart, True),
+        ("ingen uventede huller", "dmi/ringsted_2026.csv", drop_midt, True),
+        ("aargraenser",           "dmi/ringsted_2026.csv", klip_aarsstart, True),
         ("mfrr_cap auction", "mfrr_cap/DK1_2026.csv", drop_midt, True),
         ("dmi-akse", "dmi/fyn_2026.csv", skift_tid, True),
     ]
